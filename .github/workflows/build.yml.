@@ -1,0 +1,1061 @@
+name: Build FitBoss APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p fitboss
+          cd fitboss
+          cat > settings.gradle.kts <<'FITBOSS_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FitBoss"
+          include(":app")
+          FITBOSS_EOF
+          cat > build.gradle.kts <<'FITBOSS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FITBOSS_EOF
+          cat > gradle.properties <<'FITBOSS_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          FITBOSS_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FITBOSS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.fitboss.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.fitboss.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk {
+                      abiFilters += listOf("arm64-v8a")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              androidResources {
+                  noCompress += listOf("task", "tflite")
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-view:1.3.4")
+              implementation("com.google.mediapipe:tasks-vision:0.10.14")
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FITBOSS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="FitBoss"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+
+                  <activity
+                      android:name=".MenuActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".GameActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+              </application>
+          </manifest>
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/Exercise.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          enum class Exercise(val title: String, val emoji: String, val damage: Int, val hint: String) {
+              PUSHUP("Отжимания", "💪", 1, "Телефон на полу сбоку: видно всё тело в упоре лёжа"),
+              CLAP("Хлопки", "👏", 2, "Отжимание с хлопком: отталкивайся резко. Телефон сбоку"),
+              PULLUP("Подтягивания", "🧗", 3, "Телефон спереди: видно голову, плечи и руки на перекладине"),
+              SQUAT("Приседания", "🦵", 1, "Телефон спереди или сбоку: видно от плеч до стоп"),
+              SITUP("Пресс", "🔥", 1, "Телефон сбоку, лёжа на спине: видно всё тело")
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/GameActivity.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.hardware.display.DisplayManager
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.Surface
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.core.AspectRatio
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.core.content.ContextCompat
+          import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+          import java.util.concurrent.Executors
+
+          class GameActivity : AppCompatActivity() {
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+              private lateinit var game: GameView
+              private lateinit var previewView: PreviewView
+              private lateinit var skeleton: SkeletonView
+              private lateinit var camBox: FrameLayout
+              private lateinit var statusTv: TextView
+
+              private val executor = Executors.newSingleThreadExecutor()
+              private var analyzer: PoseAnalyzer? = null
+              private var analysisUseCase: ImageAnalysis? = null
+              private var provider: ProcessCameraProvider? = null
+
+              private var exercise = Exercise.PUSHUP
+              private var counter = RepCounter(Exercise.PUSHUP)
+              private var front = true
+              private val exButtons = ArrayList<Button>()
+
+              private val tone: ToneGenerator? = try {
+                  ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+              } catch (e: Exception) {
+                  null
+              }
+
+              private val permLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      if (ok) {
+                          startCamera()
+                      } else {
+                          statusTv.text = "Нужен доступ к камере, без него повторения не считаются"
+                          Toast.makeText(this, "Разреши камеру в настройках", Toast.LENGTH_LONG).show()
+                      }
+                  }
+
+              private val displayListener = object : DisplayManager.DisplayListener {
+                  override fun onDisplayAdded(displayId: Int) {}
+                  override fun onDisplayRemoved(displayId: Int) {}
+                  override fun onDisplayChanged(displayId: Int) {
+                      val d = previewView.display ?: return
+                      analysisUseCase?.targetRotation = d.rotation
+                      updateCamBox()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  val root = FrameLayout(this)
+                  game = GameView(this)
+                  root.addView(game, FrameLayout.LayoutParams(MATCH, MATCH))
+
+                  previewView = PreviewView(this)
+                  previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                  previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+                  skeleton = SkeletonView(this)
+                  camBox = FrameLayout(this)
+                  camBox.setBackgroundColor(Color.BLACK)
+                  camBox.addView(previewView, FrameLayout.LayoutParams(MATCH, MATCH))
+                  camBox.addView(skeleton, FrameLayout.LayoutParams(MATCH, MATCH))
+                  updateCamBox()
+                  root.addView(camBox)
+
+                  val panel = LinearLayout(this)
+                  panel.orientation = LinearLayout.VERTICAL
+                  panel.setBackgroundColor(0xCC000000.toInt())
+                  panel.setPadding(dp(8), dp(6), dp(8), dp(6))
+
+                  statusTv = TextView(this)
+                  statusTv.setTextColor(Color.WHITE)
+                  statusTv.textSize = 13f
+                  panel.addView(statusTv)
+
+                  val scroll = HorizontalScrollView(this)
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  for (ex in Exercise.values()) {
+                      val b = Button(this)
+                      b.text = "${ex.emoji} ${ex.title}"
+                      b.isAllCaps = false
+                      b.setOnClickListener { select(ex) }
+                      exButtons.add(b)
+                      row.addView(b)
+                  }
+                  scroll.addView(row)
+                  panel.addView(scroll)
+
+                  val row2 = LinearLayout(this)
+                  row2.orientation = LinearLayout.HORIZONTAL
+                  val camBtn = Button(this)
+                  camBtn.text = "🔄 Камера"
+                  camBtn.isAllCaps = false
+                  camBtn.setOnClickListener {
+                      front = !front
+                      bind()
+                  }
+                  val exitBtn = Button(this)
+                  exitBtn.text = "⏹ Закончить"
+                  exitBtn.isAllCaps = false
+                  exitBtn.setOnClickListener { finish() }
+                  row2.addView(camBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  row2.addView(exitBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  panel.addView(row2)
+
+                  root.addView(panel, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
+                  setContentView(root)
+
+                  game.onRoundCleared = { r ->
+                      Prefs.setBest(this, r + 1)
+                      try {
+                          tone?.startTone(ToneGenerator.TONE_PROP_ACK, 300)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  game.startRound(1)
+                  select(Exercise.PUSHUP)
+
+                  val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                  dm.registerDisplayListener(displayListener, null)
+
+                  try {
+                      analyzer = PoseAnalyzer(this) { lm, w, h -> runOnUiThread { handle(lm, w, h) } }
+                  } catch (e: Exception) {
+                      statusTv.text = "Не удалось загрузить модель позы: ${e.message}"
+                  }
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                      == PackageManager.PERMISSION_GRANTED
+                  ) {
+                      startCamera()
+                  } else {
+                      permLauncher.launch(Manifest.permission.CAMERA)
+                  }
+              }
+
+              private fun isLandscape(): Boolean {
+                  val rot = previewView.display?.rotation
+                  return if (rot != null) {
+                      rot == Surface.ROTATION_90 || rot == Surface.ROTATION_270
+                  } else {
+                      resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                  }
+              }
+
+              private fun updateCamBox() {
+                  val land = isLandscape()
+                  val w = if (land) dp(200) else dp(130)
+                  val h = if (land) dp(150) else dp(173)
+                  val lp = FrameLayout.LayoutParams(w, h, Gravity.TOP or Gravity.END)
+                  lp.setMargins(dp(8), dp(8), dp(8), dp(8))
+                  camBox.layoutParams = lp
+              }
+
+              private fun select(ex: Exercise) {
+                  exercise = ex
+                  counter = RepCounter(ex)
+                  val all = Exercise.values()
+                  for (i in all.indices) {
+                      exButtons[i].alpha = if (all[i] == ex) 1f else 0.45f
+                  }
+                  statusTv.text = ex.hint
+              }
+
+              private fun startCamera() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      provider = future.get()
+                      bind()
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun bind() {
+                  val p = provider ?: return
+                  val an = analyzer
+                  if (an == null) {
+                      statusTv.text = "Модель позы не загрузилась, считать нечем"
+                      return
+                  }
+                  val preview = Preview.Builder()
+                      .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                      .build()
+                  preview.setSurfaceProvider(previewView.surfaceProvider)
+
+                  val analysis = ImageAnalysis.Builder()
+                      .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                      .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                      .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                      .build()
+                  analysis.setAnalyzer(executor, an)
+                  analysisUseCase = analysis
+
+                  val selector = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                  skeleton.mirror = front
+                  try {
+                      p.unbindAll()
+                      p.bindToLifecycle(this, selector, preview, analysis)
+                  } catch (e: Exception) {
+                      statusTv.text = "Камера недоступна: ${e.message}"
+                  }
+              }
+
+              private fun handle(lm: List<NormalizedLandmark>?, w: Int, h: Int) {
+                  skeleton.points = lm
+                  skeleton.invalidate()
+                  if (lm == null || lm.size < 29) {
+                      statusTv.text = "${exercise.hint}\nТебя не видно: встань в кадр"
+                      return
+                  }
+                  val gained = counter.update(lm, w.toFloat(), h.toFloat(), SystemClock.uptimeMillis())
+                  statusTv.text = "${exercise.hint}\n${counter.status}"
+                  if (gained > 0) onRep()
+              }
+
+              private fun onRep() {
+                  Prefs.addReps(this, 1)
+                  game.hit(exercise.damage)
+                  try {
+                      tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 80)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  Prefs.setBest(this, game.round)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                  dm.unregisterDisplayListener(displayListener)
+                  val an = analyzer
+                  executor.execute { an?.close() }
+                  executor.shutdown()
+                  tone?.release()
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/GameView.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.View
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          class Enemy(val emoji: String, val name: String, val maxHp: Int, val boss: Boolean) {
+              var hp = maxHp
+          }
+
+          class FloatText(val text: String, var x: Float, var y: Float, val color: Int) {
+              var life = 1f
+          }
+
+          class GameView(context: Context) : View(context) {
+              var round = 0
+                  private set
+              var kills = 0
+                  private set
+              var reps = 0
+                  private set
+              var onRoundCleared: ((Int) -> Unit)? = null
+
+              private var enemies = ArrayList<Enemy>()
+              private val floats = ArrayList<FloatText>()
+              private var shake = 0f
+              private var flash = 0f
+              private var bannerText = ""
+              private var bannerLife = 0f
+              private var lastFrame = 0L
+              private var time = 0f
+
+              private val zombieSkins = arrayOf("🧟", "🧟‍♂️", "🧟‍♀️")
+              private val bosses = arrayOf(
+                  "👹" to "Огр", "💀" to "Король скелетов", "🐉" to "Дракон",
+                  "👾" to "Пришелец", "🦖" to "Тирекс", "😈" to "Демон", "🤖" to "Мегаробот"
+              )
+
+              private val emojiPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+              private val centerText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  color = Color.WHITE
+                  isFakeBoldText = true
+              }
+              private val hudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.LEFT
+                  color = Color.WHITE
+                  isFakeBoldText = true
+              }
+              private val barBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x55FFFFFF }
+              private val barFill = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              fun startRound(n: Int) {
+                  round = n
+                  val list = ArrayList<Enemy>()
+                  if (n % 2 == 0) {
+                      val b = bosses[(n / 2 - 1) % bosses.size]
+                      list.add(Enemy(b.first, b.second, 12 + n * 4, true))
+                      bannerText = "Раунд $n: БОСС ${b.second}"
+                  } else {
+                      val count = 3 + n / 2
+                      val hp = 2 + n / 2
+                      for (i in 0 until count) {
+                          list.add(Enemy(zombieSkins[i % zombieSkins.size], "Зомби", hp, false))
+                      }
+                      bannerText = "Раунд $n: ВОЛНА ЗОМБИ"
+                  }
+                  enemies = list
+                  bannerLife = 2.5f
+                  invalidate()
+              }
+
+              fun hit(dmg: Int) {
+                  val e = enemies.firstOrNull() ?: return
+                  reps++
+                  e.hp -= dmg
+                  shake = 1f
+                  flash = 0.35f
+                  floats.add(
+                      FloatText(
+                          "-$dmg",
+                          width / 2f + (Math.random().toFloat() - 0.5f) * width * 0.3f,
+                          height * 0.38f,
+                          Color.YELLOW
+                      )
+                  )
+                  if (e.hp <= 0) {
+                      enemies.removeAt(0)
+                      kills++
+                      floats.add(
+                          FloatText(
+                              if (e.boss) "БОСС ПОВЕРЖЕН!" else "💥",
+                              width / 2f, height * 0.3f, Color.rgb(255, 120, 0)
+                          )
+                      )
+                      if (enemies.isEmpty()) {
+                          val done = round
+                          startRound(round + 1)
+                          onRoundCleared?.invoke(done)
+                      }
+                  }
+                  invalidate()
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val now = System.nanoTime()
+                  val dt = if (lastFrame == 0L) 0.033f else ((now - lastFrame) / 1e9f).coerceAtMost(0.1f)
+                  lastFrame = now
+                  time += dt
+
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val s = min(w, h)
+                  c.drawColor(0xFF14101F.toInt())
+
+                  // HUD
+                  hudPaint.textSize = s * 0.05f
+                  c.drawText("Раунд $round", s * 0.04f, s * 0.08f, hudPaint)
+                  c.drawText("Повторений: $reps", s * 0.04f, s * 0.15f, hudPaint)
+                  c.drawText("Убито: $kills", s * 0.04f, s * 0.22f, hudPaint)
+
+                  val e = enemies.firstOrNull()
+                  if (e != null) {
+                      val bob = sin(time * 3f) * s * 0.01f
+                      val sx = (Math.random().toFloat() - 0.5f) * 2f * shake * s * 0.03f
+                      val cx = w / 2f + sx
+                      val cy = h * 0.45f + bob
+                      emojiPaint.textSize = s * (if (e.boss) 0.42f else 0.3f)
+                      c.drawText(e.emoji, cx, cy + emojiPaint.textSize * 0.35f, emojiPaint)
+
+                      val bw = w * 0.6f
+                      val bh = s * 0.04f
+                      val bx = (w - bw) / 2f
+                      val by = h * 0.62f
+                      c.drawRoundRect(bx, by, bx + bw, by + bh, bh / 2f, bh / 2f, barBg)
+                      barFill.color = if (e.boss) Color.rgb(220, 40, 40) else Color.rgb(80, 200, 80)
+                      val frac = (e.hp.toFloat() / e.maxHp).coerceIn(0f, 1f)
+                      if (frac > 0f) {
+                          c.drawRoundRect(bx, by, bx + bw * frac, by + bh, bh / 2f, bh / 2f, barFill)
+                      }
+                      centerText.textSize = s * 0.05f
+                      c.drawText("${e.name}  ${e.hp.coerceAtLeast(0)}/${e.maxHp}", w / 2f, by + bh + s * 0.065f, centerText)
+                      if (!e.boss) {
+                          centerText.textSize = s * 0.04f
+                          c.drawText("Осталось врагов: ${enemies.size}", w / 2f, by + bh + s * 0.12f, centerText)
+                      }
+                  }
+
+                  if (flash > 0f) {
+                      c.drawColor(Color.argb((flash * 255f).toInt().coerceIn(0, 255), 255, 0, 0))
+                      flash -= dt * 1.5f
+                  }
+                  if (shake > 0f) shake = (shake - dt * 4f).coerceAtLeast(0f)
+
+                  val it = floats.iterator()
+                  while (it.hasNext()) {
+                      val f = it.next()
+                      f.y -= dt * s * 0.25f
+                      f.life -= dt * 0.8f
+                      if (f.life <= 0f) {
+                          it.remove()
+                          continue
+                      }
+                      centerText.textSize = s * 0.09f
+                      centerText.color = f.color
+                      centerText.alpha = (f.life.coerceIn(0f, 1f) * 255f).toInt()
+                      c.drawText(f.text, f.x, f.y, centerText)
+                  }
+                  centerText.color = Color.WHITE
+                  centerText.alpha = 255
+
+                  if (bannerLife > 0f) {
+                      centerText.textSize = s * 0.06f
+                      centerText.alpha = (bannerLife.coerceIn(0f, 1f) * 255f).toInt()
+                      c.drawText(bannerText, w / 2f, h * 0.30f, centerText)
+                      centerText.alpha = 255
+                      bannerLife -= dt
+                  }
+
+                  postInvalidateDelayed(33)
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/MenuActivity.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import kotlin.math.min
+
+          class MenuActivity : AppCompatActivity() {
+              private lateinit var tvRank: TextView
+              private lateinit var tvStats: TextView
+              private lateinit var tvDaily: TextView
+              private lateinit var bar: ProgressBar
+
+              private fun label(text: String, size: Float, bold: Boolean = false): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.textSize = size
+                  t.setTextColor(Color.WHITE)
+                  if (bold) t.paint.isFakeBoldText = true
+                  t.setPadding(0, dp(6), 0, dp(6))
+                  return t
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val scroll = ScrollView(this)
+                  scroll.setBackgroundColor(0xFF14101F.toInt())
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(24), dp(40), dp(24), dp(24))
+                  scroll.addView(col)
+
+                  col.addView(label("⚔️ FitBoss", 34f, true))
+                  col.addView(label("Каждое повторение — удар по врагу. Камера сама считает.", 15f))
+
+                  tvRank = label("", 18f, true)
+                  tvStats = label("", 15f)
+                  tvDaily = label("", 15f)
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  col.addView(tvRank)
+                  col.addView(tvStats)
+                  col.addView(tvDaily)
+                  col.addView(bar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(12)))
+
+                  val start = Button(this)
+                  start.text = "⚔️ В БОЙ"
+                  start.textSize = 20f
+                  start.setOnClickListener { startActivity(Intent(this, GameActivity::class.java)) }
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(64))
+                  lp.topMargin = dp(24)
+                  lp.bottomMargin = dp(16)
+                  col.addView(start, lp)
+
+                  col.addView(
+                      label(
+                          "Как ставить телефон:\n" +
+                              "• Отжимания, хлопки, пресс: на пол сбоку, чтобы всё тело было в кадре.\n" +
+                              "• Подтягивания: спереди, видно голову, плечи и руки.\n" +
+                              "• Приседания: спереди или сбоку, видно от плеч до стоп.\n\n" +
+                              "Раунды: волна зомби, потом босс, потом снова волна, но сильнее.\n" +
+                              "Урон: отжимание, приседание, пресс = 1, хлопок = 2, подтягивание = 3.\n" +
+                              "Упражнение можно менять прямо в бою.",
+                          14f
+                      )
+                  )
+                  setContentView(scroll)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val total = Prefs.total(this)
+                  val (rank, next) = Prefs.rank(total)
+                  tvRank.text = "Звание: $rank" + if (next > 0) "  (до следующего: ${next - total})" else ""
+                  tvStats.text = "🔥 Серия: ${Prefs.streak(this)} дн.\nВсего повторений: $total\nРекорд: раунд ${Prefs.best(this)}"
+                  val today = Prefs.todayReps(this)
+                  tvDaily.text = "Задание дня: $today / ${Prefs.DAILY_GOAL}" + if (today >= Prefs.DAILY_GOAL) "  ✅" else ""
+                  bar.max = Prefs.DAILY_GOAL
+                  bar.progress = min(today, Prefs.DAILY_GOAL)
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/PoseAnalyzer.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Matrix
+          import android.os.SystemClock
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.ImageProxy
+          import com.google.mediapipe.framework.image.BitmapImageBuilder
+          import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+          import com.google.mediapipe.tasks.core.BaseOptions
+          import com.google.mediapipe.tasks.vision.core.RunningMode
+          import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
+
+          class PoseAnalyzer(
+              context: Context,
+              private val onResult: (List<NormalizedLandmark>?, Int, Int) -> Unit
+          ) : ImageAnalysis.Analyzer {
+
+              private val landmarker: PoseLandmarker
+              private var lastTs = 0L
+
+              init {
+                  val base = BaseOptions.builder()
+                      .setModelAssetPath("pose_landmarker_lite.task")
+                      .build()
+                  val options = PoseLandmarker.PoseLandmarkerOptions.builder()
+                      .setBaseOptions(base)
+                      .setRunningMode(RunningMode.VIDEO)
+                      .setNumPoses(1)
+                      .setMinPoseDetectionConfidence(0.5f)
+                      .setMinPosePresenceConfidence(0.5f)
+                      .setMinTrackingConfidence(0.5f)
+                      .build()
+                  landmarker = PoseLandmarker.createFromOptions(context, options)
+              }
+
+              override fun analyze(image: ImageProxy) {
+                  try {
+                      val rot = image.imageInfo.rotationDegrees
+                      val src = image.toBitmap()
+                      val bmp: Bitmap = if (rot != 0) {
+                          val m = Matrix()
+                          m.postRotate(rot.toFloat())
+                          Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
+                      } else {
+                          src
+                      }
+                      var ts = SystemClock.uptimeMillis()
+                      if (ts <= lastTs) ts = lastTs + 1
+                      lastTs = ts
+                      val result = landmarker.detectForVideo(BitmapImageBuilder(bmp).build(), ts)
+                      val lm = result.landmarks().firstOrNull()
+                      onResult(lm, bmp.width, bmp.height)
+                  } catch (e: Exception) {
+                      onResult(null, 0, 0)
+                  } finally {
+                      image.close()
+                  }
+              }
+
+              fun close() {
+                  try {
+                      landmarker.close()
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/Prefs.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.content.Context
+          import java.time.LocalDate
+
+          object Prefs {
+              const val DAILY_GOAL = 50
+
+              private val ranks = listOf(
+                  0 to "Новичок",
+                  100 to "Боец",
+                  500 to "Воин",
+                  1500 to "Ветеран",
+                  5000 to "Легенда"
+              )
+
+              private fun sp(c: Context) = c.getSharedPreferences("fitboss", Context.MODE_PRIVATE)
+              private fun today(): Long = LocalDate.now().toEpochDay()
+
+              fun addReps(c: Context, n: Int) {
+                  val s = sp(c)
+                  val t = today()
+                  val last = s.getLong("lastDay", -1L)
+                  var streak = s.getInt("streak", 0)
+                  var todayReps = if (last == t) s.getInt("todayReps", 0) else 0
+                  if (last != t) {
+                      streak = if (last == t - 1) streak + 1 else 1
+                  }
+                  todayReps += n
+                  s.edit()
+                      .putLong("lastDay", t)
+                      .putInt("streak", streak)
+                      .putInt("todayReps", todayReps)
+                      .putInt("total", s.getInt("total", 0) + n)
+                      .apply()
+              }
+
+              fun streak(c: Context): Int {
+                  val s = sp(c)
+                  val last = s.getLong("lastDay", -1L)
+                  val t = today()
+                  return if (last == t || last == t - 1) s.getInt("streak", 0) else 0
+              }
+
+              fun todayReps(c: Context): Int {
+                  val s = sp(c)
+                  return if (s.getLong("lastDay", -1L) == today()) s.getInt("todayReps", 0) else 0
+              }
+
+              fun total(c: Context): Int = sp(c).getInt("total", 0)
+
+              fun best(c: Context): Int = sp(c).getInt("bestRound", 0)
+
+              fun setBest(c: Context, round: Int) {
+                  if (round > best(c)) sp(c).edit().putInt("bestRound", round).apply()
+              }
+
+              /** Возвращает звание и сколько всего повторений нужно для следующего (0 если максимум). */
+              fun rank(total: Int): Pair<String, Int> {
+                  var name = ranks[0].second
+                  var next = 0
+                  for (i in ranks.indices) {
+                      if (total >= ranks[i].first) {
+                          name = ranks[i].second
+                          next = if (i + 1 < ranks.size) ranks[i + 1].first else 0
+                      }
+                  }
+                  return name to next
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/RepCounter.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+          import kotlin.math.abs
+          import kotlin.math.atan2
+
+          /** Считает повторения по точкам тела. Один счётчик на одно упражнение. */
+          class RepCounter(val exercise: Exercise) {
+              var status: String = "Встань в кадр"
+                  private set
+
+              private var phaseDown = false
+              private var smooth = -1.0
+              private var pushStart = 0L
+              private var w = 1f
+              private var h = 1f
+
+              private fun vis(l: NormalizedLandmark): Float = l.visibility().orElse(0f)
+
+              private fun pt(l: NormalizedLandmark): DoubleArray =
+                  doubleArrayOf((l.x() * w).toDouble(), (l.y() * h).toDouble())
+
+              private fun angle(a: DoubleArray, b: DoubleArray, c: DoubleArray): Double {
+                  val a1 = atan2(a[1] - b[1], a[0] - b[0])
+                  val a2 = atan2(c[1] - b[1], c[0] - b[0])
+                  var deg = Math.toDegrees(abs(a1 - a2))
+                  if (deg > 180.0) deg = 360.0 - deg
+                  return deg
+              }
+
+              private fun smoothed(v: Double): Double {
+                  smooth = if (smooth < 0) v else smooth * 0.5 + v * 0.5
+                  return smooth
+              }
+
+              private fun pick(lm: List<NormalizedLandmark>, left: IntArray, right: IntArray): IntArray? {
+                  val lv = left.minOf { vis(lm[it]) }
+                  val rv = right.minOf { vis(lm[it]) }
+                  val best = if (lv >= rv) left else right
+                  return if (maxOf(lv, rv) >= 0.4f) best else null
+              }
+
+              private fun hidden(): Int {
+                  status = "Тебя не видно: встань в кадр целиком"
+                  return 0
+              }
+
+              /** Возвращает 1, если засчитано новое повторение, иначе 0. */
+              fun update(lm: List<NormalizedLandmark>, width: Float, height: Float, now: Long): Int {
+                  w = width
+                  h = height
+                  if (lm.size < 29) return hidden()
+                  return when (exercise) {
+                      Exercise.PUSHUP, Exercise.CLAP -> pushup(lm, now)
+                      Exercise.PULLUP -> pullup(lm)
+                      Exercise.SQUAT -> squat(lm)
+                      Exercise.SITUP -> situp(lm)
+                  }
+              }
+
+              private fun pushup(lm: List<NormalizedLandmark>, now: Long): Int {
+                  val s = pick(lm, intArrayOf(11, 13, 15, 23), intArrayOf(12, 14, 16, 24)) ?: return hidden()
+                  val sh = pt(lm[s[0]])
+                  val el = pt(lm[s[1]])
+                  val wr = pt(lm[s[2]])
+                  val hp = pt(lm[s[3]])
+                  val horizontal = abs(sh[0] - hp[0]) > abs(sh[1] - hp[1])
+                  if (!horizontal) {
+                      status = "Прими упор лёжа (тело горизонтально)"
+                      return 0
+                  }
+                  val a = smoothed(angle(sh, el, wr))
+                  status = "Угол локтя: ${a.toInt()}°"
+                  if (a < 95) {
+                      phaseDown = true
+                      pushStart = 0L
+                  } else if (phaseDown) {
+                      if (a > 110 && pushStart == 0L) pushStart = now
+                      if (a > 155) {
+                          val dur = now - pushStart
+                          phaseDown = false
+                          pushStart = 0L
+                          if (exercise == Exercise.CLAP) {
+                              if (dur in 1L..400L) return 1
+                              status = "Оттолкнись резче для хлопка!"
+                              return 0
+                          }
+                          return 1
+                      }
+                  }
+                  return 0
+              }
+
+              private fun pullup(lm: List<NormalizedLandmark>): Int {
+                  val ids = intArrayOf(0, 11, 12, 13, 14, 15, 16)
+                  if (ids.any { vis(lm[it]) < 0.4f }) return hidden()
+                  val angL = angle(pt(lm[11]), pt(lm[13]), pt(lm[15]))
+                  val angR = angle(pt(lm[12]), pt(lm[14]), pt(lm[16]))
+                  val elbow = smoothed((angL + angR) / 2.0)
+                  val wristY = (lm[15].y() + lm[16].y()) / 2f
+                  val shoulderY = (lm[11].y() + lm[12].y()) / 2f
+                  status = "Локти: ${elbow.toInt()}°"
+                  if (elbow > 145 && wristY < shoulderY) phaseDown = true
+                  if (phaseDown && lm[0].y() < wristY && elbow < 115) {
+                      phaseDown = false
+                      return 1
+                  }
+                  return 0
+              }
+
+              private fun squat(lm: List<NormalizedLandmark>): Int {
+                  val s = pick(lm, intArrayOf(23, 25, 27), intArrayOf(24, 26, 28)) ?: return hidden()
+                  val a = smoothed(angle(pt(lm[s[0]]), pt(lm[s[1]]), pt(lm[s[2]])))
+                  status = "Колени: ${a.toInt()}°"
+                  if (a < 100) {
+                      phaseDown = true
+                  } else if (a > 160 && phaseDown) {
+                      phaseDown = false
+                      return 1
+                  }
+                  return 0
+              }
+
+              private fun situp(lm: List<NormalizedLandmark>): Int {
+                  val s = pick(lm, intArrayOf(11, 23, 25), intArrayOf(12, 24, 26)) ?: return hidden()
+                  val a = smoothed(angle(pt(lm[s[0]]), pt(lm[s[1]]), pt(lm[s[2]])))
+                  status = "Корпус: ${a.toInt()}°"
+                  if (a > 125) {
+                      phaseDown = true
+                  } else if (a < 85 && phaseDown) {
+                      phaseDown = false
+                      return 1
+                  }
+                  return 0
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/SkeletonView.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.View
+          import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+
+          class SkeletonView(context: Context) : View(context) {
+              var points: List<NormalizedLandmark>? = null
+              var mirror = false
+
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.GREEN
+                  strokeWidth = 4f * resources.displayMetrics.density
+              }
+              private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.YELLOW }
+
+              private val links = listOf(
+                  11 to 12, 11 to 13, 13 to 15, 12 to 14, 14 to 16,
+                  11 to 23, 12 to 24, 23 to 24, 23 to 25, 25 to 27, 24 to 26, 26 to 28
+              )
+              private val joints = intArrayOf(0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+
+              private fun px(x: Float, w: Float): Float = if (mirror) (1f - x) * w else x * w
+
+              override fun onDraw(canvas: Canvas) {
+                  val p = points ?: return
+                  if (p.size < 29) return
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  for ((a, b) in links) {
+                      val la = p[a]
+                      val lb = p[b]
+                      if (la.visibility().orElse(0f) < 0.4f || lb.visibility().orElse(0f) < 0.4f) continue
+                      canvas.drawLine(px(la.x(), w), la.y() * h, px(lb.x(), w), lb.y() * h, line)
+                  }
+                  val r = 4f * resources.displayMetrics.density
+                  for (i in joints) {
+                      val l = p[i]
+                      if (l.visibility().orElse(0f) < 0.4f) continue
+                      canvas.drawCircle(px(l.x(), w), l.y() * h, r, dot)
+                  }
+              }
+          }
+          FITBOSS_EOF
+          mkdir -p app/src/main/java/com/fitboss/app
+          cat > app/src/main/java/com/fitboss/app/Utils.kt <<'FITBOSS_EOF'
+          package com.fitboss.app
+
+          import android.content.Context
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          FITBOSS_EOF
+
+      - name: Download pose model
+        working-directory: fitboss
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fL --retry 3 -o app/src/main/assets/pose_landmarker_lite.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
+          ls -l app/src/main/assets
+
+      - name: Build APK
+        working-directory: fitboss
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FitBoss-apk
+          path: fitboss/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fitboss-${{ github.run_number }}
+          name: FitBoss build ${{ github.run_number }}
+          files: fitboss/app/build/outputs/apk/debug/app-debug.apk
